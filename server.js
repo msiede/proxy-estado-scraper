@@ -186,6 +186,47 @@ if (keySello) {
 // ======== RUTAS ========
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Devuelve el HTML tras buscar por patente (usar solo para diagnóstico)
+app.get('/api/debug', async (req, res) => {
+  const patente = String(req.query.patente || '').toUpperCase().trim();
+  if (!patente) return res.status(400).send('patente requerida');
+  let browser;
+  try {
+    browser = await chromium.launch({ args: ['--no-sandbox','--disable-setuid-sandbox'] });
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+
+    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    const inputSelectors = [
+      'input[placeholder*="Patente" i]',
+      'input[name*="patent" i]',
+      'input[id*="patent" i]',
+      'input[type="text"]'
+    ];
+    for (const sel of inputSelectors) {
+      const el = await page.$(sel);
+      if (el) { await el.fill(patente); break; }
+    }
+    const btnSelectors = ['button:has-text("Buscar")','text=Buscar','input[type="submit"]'];
+    for (const sel of btnSelectors) {
+      const el = await page.$(sel);
+      if (el) { await el.click(); break; }
+    }
+
+    // Esperar actividad de red y/o un pequeño tiempo
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+    await page.waitForTimeout(1000);
+
+    const html = await page.content();
+    await browser.close(); browser = null;
+    res.type('text/html').send(html);
+  } catch (e) {
+    if (browser) await browser.close();
+    res.status(500).send('debug error: ' + e.message);
+  }
+});
+
 app.get('/api/estado', async (req, res) => {
   const patente = String(req.query.patente || '').toUpperCase().trim();
   const debug = String(req.query.debug || '').toLowerCase() === '1';
