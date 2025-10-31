@@ -162,11 +162,13 @@ async function runScrape(patente, debug = false) {
       return out;
     });
 
-    // 6) Normalizar “Estado Sello”
-    const keySello = Object.keys(datos).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
-    if (keySello) {
-      datos[keySello] = String(datos[keySello]).trim();
-    }
+   // 6) Normalizar la clave y el valor de “Estado Sello”
+const keySello = Object.keys(datos).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
+if (keySello) {
+  const valor = String(datos[keySello]).trim().toUpperCase();
+  datos['Estado Sello'] = valor;
+  if (keySello !== 'Estado Sello') delete datos[keySello];
+}
 
     // 7) (Opcional) captura pantalla si debug
     if (debug) {
