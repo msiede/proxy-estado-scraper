@@ -85,14 +85,15 @@ async function runScrape(patente, debug = false) {
     }
     if (!okWait) await page.waitForTimeout(2000);
 
-    // 5) Extraer pares clave/valor (dirigido + filtros)
+    // 5) Extraer pares clave/valor (dirigido + filtros + link Ubicación)
     const datos = await page.evaluate(() => {
       const out = {};
 
+      const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
       const add = (k, v) => {
-        if (!k || !v) return;
-        const key = String(k).replace(/\s+/g, ' ').trim();
-        const val = String(v).replace(/\s+/g, ' ').trim();
+        const key = norm(k);
+        const val = norm(v);
+        if (!key || !val) return;
         // descarta claves sospechosas de ser fecha/hora o sin letras
         if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(key)) return;
         if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(key)) return; // 31/10/2025
@@ -100,18 +101,37 @@ async function runScrape(patente, debug = false) {
         out[key] = val;
       };
 
+      // 0) Capturar “Ubicación” con su enlace si aparece tipo "Ver en mapa"
+      document.querySelectorAll('*, * *').forEach(el => {
+        const text = norm(el.textContent || '');
+        if (!text) return;
+        if (/^ubicación\b/i.test(text) || /\bubicación:/i.test(text)) {
+          const a = el.querySelector('a[href]') || el.nextElementSibling?.querySelector?.('a[href]') || el.parentElement?.querySelector?.('a[href]');
+          if (a?.href) out['Ubicación'] = a.href;
+        }
+      });
+
       // a) Ant Design Descriptions
       document.querySelectorAll('.ant-descriptions-item').forEach(item => {
         const k = item.querySelector('.ant-descriptions-item-label')?.textContent || '';
         const v = item.querySelector('.ant-descriptions-item-content')?.textContent || '';
-        add(k, v);
+        if (/ubicación/i.test(k)) {
+          const a = item.querySelector('a[href]');
+          add(k, a?.href || v);
+        } else {
+          add(k, v);
+        }
       });
 
       // b) Tablas <tr><th>Campo</th><td>Valor</td>
       document.querySelectorAll('table').forEach(tbl => {
         tbl.querySelectorAll('tr').forEach(tr => {
-          const cells = Array.from(tr.querySelectorAll('th,td')).map(c => c.innerText.trim()).filter(Boolean);
-          if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
+          const cells = Array.from(tr.querySelectorAll('th,td')).map(c => norm(c.innerText)).filter(Boolean);
+          if (cells.length >= 2) {
+            const m = cells[0].match(/^(.+?):\s*(.+)$/);
+            if (m && m[1] && m[2]) add(m[1], m[2]);
+            else add(cells[0], cells.slice(1).join(' | '));
+          }
         });
       });
 
@@ -121,17 +141,32 @@ async function runScrape(patente, debug = false) {
         for (let i = 0; i < Math.min(dts.length, dds.length); i++) add(dts[i].innerText, dds[i].innerText);
       });
 
-      // d) Fallback “Campo: Valor” (solo si el lado izquierdo tiene letras)
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node; const lines = [];
-      while ((node = walker.nextNode())) {
-        const t = (node.nodeValue || '').trim();
-        if (t) lines.push(t);
-      }
-      lines.forEach(t => {
-        const m = t.match(/^(.+?):\s*(.+)$/);
-        if (m && /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(m[1])) add(m[1], m[2]);
+      // d) Párrafos / líneas “<strong>Campo:</strong> Valor” o “Campo: Valor”
+      document.querySelectorAll('p, li, div').forEach(node => {
+        const strong = node.querySelector('strong, b');
+        if (strong) {
+          const label = norm(strong.textContent || '');
+          if (/:$/.test(label)) {
+            const key = label.replace(/:$/, '');
+            let val = norm(node.textContent || '').replace(label, '');
+            if (/ubicación/i.test(key)) {
+              const a = node.querySelector('a[href]');
+              if (a?.href) val = a.href;
+            }
+            if (val) add(key, val);
+          }
+        } else {
+          const t = norm(node.textContent || '');
+          const m = t.match(/^(.+?):\s+(.+)$/);
+          if (m && /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(m[1]) && m[1].length <= 60) add(m[1], m[2]);
+        }
       });
+
+      // e) Si “Ubicación” quedó como texto, intenta href global
+      if (out['Ubicación'] && !/^https?:\/\//i.test(out['Ubicación'])) {
+        const a = document.querySelector('a[href*="maps.google"], a[href*="google.com/maps"], a[href*="maps.app.goo"]');
+        if (a?.href) out['Ubicación'] = a.href;
+      }
 
       return out;
     });
