@@ -1,10 +1,11 @@
+// server.js
 import express from 'express';
 import morgan from 'morgan';
 import { chromium } from 'playwright';
 
 const app = express();
 
-// ======== CONFIG =========
+// ===== Config =====
 const PORT = process.env.PORT || 3000;
 const TARGET_URL = process.env.TARGET_URL || 'https://estado-integraciones.dev.tracktec.cl/';
 const ORIGINS = new Set(
@@ -14,18 +15,15 @@ const ORIGINS = new Set(
     .filter(Boolean)
 );
 
-// Caché en memoria (10 minutos por patente)
+// Cache en memoria (por patente)
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || (10 * 60 * 1000));
 const cache = new Map(); // patente -> { t, data }
 
-// ======== MIDDLEWARES ========
+// ===== Middlewares =====
 app.use(morgan('tiny'));
-
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
-  if (ORIGINS.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
+  if (ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -33,31 +31,27 @@ app.use((req, res, next) => {
   next();
 });
 
-// ======== UTILS ========
+// ===== Scrape util =====
 async function runScrape(patente, debug = false) {
-  // Lanzar Chromium
-  const browser = await chromium.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
+  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
     viewport: { width: 1280, height: 800 }
   });
   const page = await ctx.newPage();
 
-  // Bloquear recursos pesados para acelerar
+  // Bloquea recursos pesados
   await page.route('**/*', (route) => {
-    const req = route.request();
-    const type = req.resourceType();
-    if (['image', 'media', 'font'].includes(type)) return route.abort();
+    const t = route.request().resourceType();
+    if (['image', 'media', 'font'].includes(t)) return route.abort();
     route.continue();
   });
 
   try {
-    // 1) Ir al sitio
+    // 1) Abrir
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // 2) Escribir patente (probamos varios selectores)
+    // 2) Input patente
     const inputSelectors = [
       'input[placeholder*="Patente" i]',
       'input[name*="patent" i]',
@@ -67,52 +61,31 @@ async function runScrape(patente, debug = false) {
     let okInput = false;
     for (const sel of inputSelectors) {
       const el = await page.$(sel);
-      if (el) {
-        await el.fill(patente);
-        okInput = true;
-        break;
-      }
+      if (el) { await el.fill(patente); okInput = true; break; }
     }
     if (!okInput) throw new Error('No se encontró el input de patente');
 
-    // 3) Click en "Buscar" (intenta por texto y por botón)
-    const btnSelectors = [
-      'button:has-text("Buscar")',
-      'text=Buscar',
-      'input[type="submit"]'
-    ];
+    // 3) Buscar
+    const btnSelectors = ['button:has-text("Buscar")', 'text=Buscar', 'input[type="submit"]'];
     let okBtn = false;
     for (const sel of btnSelectors) {
       const el = await page.$(sel);
-      if (el) {
-        await el.click();
-        okBtn = true;
-        break;
-      }
+      if (el) { await el.click(); okBtn = true; break; }
     }
     if (!okBtn) throw new Error('No se encontró el botón Buscar');
 
-    // 4) Esperar resultados
-    // Idea: alguna etiqueta/label que suela aparecer. Ajusta si conoces la real.
-    const waitSelectors = [
-      'text="Estado Sello"',
-      'text=Estado Sello',
-      '.resultado, .resultados, .card, .table'
-    ];
+    // 3.1) Esperar actividad de red tras el click
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+
+    // 4) Esperar algún indicador de resultado
+    const waitSelectors = ['text=Estado Sello', '.ant-descriptions', '.table', '.card', '.resultados', '.resultado'];
     let okWait = false;
     for (const sel of waitSelectors) {
-      try {
-        await page.waitForSelector(sel, { timeout: 15000 });
-        okWait = true;
-        break;
-      } catch {}
+      try { await page.waitForSelector(sel, { timeout: 15000 }); okWait = true; break; } catch {}
     }
-    if (!okWait) {
-      // Último intento: espera cualquier cambio de red y un tiempo
-      await page.waitForTimeout(3000);
-    }
+    if (!okWait) await page.waitForTimeout(2000);
 
-       // 5) Extraer datos con selectores dirigidos y filtrando fechas/horas
+    // 5) Extraer pares clave/valor (dirigido + filtros)
     const datos = await page.evaluate(() => {
       const out = {};
 
@@ -120,14 +93,14 @@ async function runScrape(patente, debug = false) {
         if (!k || !v) return;
         const key = String(k).replace(/\s+/g, ' ').trim();
         const val = String(v).replace(/\s+/g, ' ').trim();
-        // descartar claves sin letras (o que parezcan fecha/hora)
+        // descarta claves sospechosas de ser fecha/hora o sin letras
         if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(key)) return;
-        if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(key)) return;  // ejemplo: 31/10/2025
-        if (/^\d{1,2}:\d{2}$/.test(key)) return;              // ejemplo: 07:49
+        if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(key)) return; // 31/10/2025
+        if (/^\d{1,2}:\d{2}$/.test(key)) return;             // 07:49
         out[key] = val;
       };
 
-      // a) Ant Design Descriptions (muy común en paneles React)
+      // a) Ant Design Descriptions
       document.querySelectorAll('.ant-descriptions-item').forEach(item => {
         const k = item.querySelector('.ant-descriptions-item-label')?.textContent || '';
         const v = item.querySelector('.ant-descriptions-item-content')?.textContent || '';
@@ -145,12 +118,10 @@ async function runScrape(patente, debug = false) {
       // c) Definition lists <dl><dt>Campo</dt><dd>Valor</dd>
       document.querySelectorAll('dl').forEach(dl => {
         const dts = dl.querySelectorAll('dt'); const dds = dl.querySelectorAll('dd');
-        for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
-          add(dts[i].innerText, dds[i].innerText);
-        }
+        for (let i = 0; i < Math.min(dts.length, dds.length); i++) add(dts[i].innerText, dds[i].innerText);
       });
 
-      // d) Fallback “Campo: Valor” SOLO si lado izquierdo tiene letras
+      // d) Fallback “Campo: Valor” (solo si el lado izquierdo tiene letras)
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node; const lines = [];
       while ((node = walker.nextNode())) {
@@ -165,7 +136,7 @@ async function runScrape(patente, debug = false) {
       return out;
     });
 
-    // 6) Normalizar la clave y el valor de “Estado Sello”
+    // 6) Normalizar “Estado Sello” (clave fija y valor en MAYÚSCULAS)
     const keySello = Object.keys(datos).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
     if (keySello) {
       const valor = String(datos[keySello]).trim().toUpperCase();
@@ -173,15 +144,11 @@ async function runScrape(patente, debug = false) {
       if (keySello !== 'Estado Sello') delete datos[keySello];
     }
 
-    // 6.bis) Asegurar que siempre devolvemos la patente consultada
-    if (!datos['Patente']) {
-      datos['Patente'] = patente;
-    }
+    // 6.bis) Asegurar patente en la respuesta
+    if (!datos['Patente']) datos['Patente'] = patente;
 
-    // 7) (Opcional) captura pantalla si debug
-    if (debug) {
-      await page.screenshot({ path: 'debug.png', fullPage: true });
-    }
+    // 7) Screenshot opcional
+    if (debug) await page.screenshot({ path: 'debug.png', fullPage: true });
 
     await browser.close();
     return datos;
@@ -191,10 +158,38 @@ async function runScrape(patente, debug = false) {
   }
 }
 
-// ======== RUTAS ========
+// ===== Rutas =====
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Devuelve el HTML tras buscar por patente (usar solo para diagnóstico)
+// Raíz amigable (para no ver 404)
+app.get('/', (req, res) => {
+  res.type('text/plain').send('OK - usa /health o /api/estado?patente=XXYY11');
+});
+
+// Endpoint principal
+app.get('/api/estado', async (req, res) => {
+  const patente = String(req.query.patente || '').toUpperCase().trim();
+  const debug = String(req.query.debug || '').toLowerCase() === '1';
+  if (!patente) return res.status(400).json({ error: 'Patente requerida' });
+
+  // Cache
+  const hit = cache.get(patente);
+  if (hit && Date.now() - hit.t < CACHE_TTL_MS) return res.json(hit.data);
+
+  try {
+    const data = await runScrape(patente, debug);
+    if (!data || Object.keys(data).length === 0) {
+      return res.status(200).json({ Patente: patente, mensaje: 'Sin datos detectados. Ajustar selectores.' });
+    }
+    cache.set(patente, { t: Date.now(), data });
+    res.json(data);
+  } catch (e) {
+    console.error('Scrape error:', e.message);
+    res.status(500).json({ error: 'Fallo de scraping', detalle: e.message });
+  }
+});
+
+// Diagnóstico: ver HTML renderizado (úsalo puntualmente)
 app.get('/api/debug', async (req, res) => {
   const patente = String(req.query.patente || '').toUpperCase().trim();
   if (!patente) return res.status(400).send('patente requerida');
@@ -212,17 +207,11 @@ app.get('/api/debug', async (req, res) => {
       'input[id*="patent" i]',
       'input[type="text"]'
     ];
-    for (const sel of inputSelectors) {
-      const el = await page.$(sel);
-      if (el) { await el.fill(patente); break; }
-    }
-    const btnSelectors = ['button:has-text("Buscar")','text=Buscar','input[type="submit"]'];
-    for (const sel of btnSelectors) {
-      const el = await page.$(sel);
-      if (el) { await el.click(); break; }
-    }
+    for (const sel of inputSelectors) { const el = await page.$(sel); if (el) { await el.fill(patente); break; } }
 
-    // Esperar actividad de red y/o un pequeño tiempo
+    const btnSelectors = ['button:has-text("Buscar")','text=Buscar','input[type="submit"]'];
+    for (const sel of btnSelectors) { const el = await page.$(sel); if (el) { await el.click(); break; } }
+
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
     await page.waitForTimeout(1000);
 
@@ -232,33 +221,6 @@ app.get('/api/debug', async (req, res) => {
   } catch (e) {
     if (browser) await browser.close();
     res.status(500).send('debug error: ' + e.message);
-  }
-});
-
-app.get('/api/estado', async (req, res) => {
-  const patente = String(req.query.patente || '').toUpperCase().trim();
-  const debug = String(req.query.debug || '').toLowerCase() === '1';
-  if (!patente) return res.status(400).json({ error: 'Patente requerida' });
-
-  // Cache
-  const hit = cache.get(patente);
-  if (hit && Date.now() - hit.t < CACHE_TTL_MS) {
-    return res.json(hit.data);
-  }
-
-  try {
-    const data = await runScrape(patente, debug);
-
-    // Si no se detectó nada, devolver algo útil
-    if (!data || Object.keys(data).length === 0) {
-      return res.status(200).json({ Patente: patente, mensaje: 'Sin datos detectados. Ajustar selectores.' });
-    }
-
-    cache.set(patente, { t: Date.now(), data });
-    res.json(data);
-  } catch (e) {
-    console.error('Scrape error:', e.message);
-    res.status(500).json({ error: 'Fallo de scraping', detalle: e.message });
   }
 });
 
