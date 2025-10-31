@@ -112,63 +112,71 @@ async function runScrape(patente, debug = false) {
       await page.waitForTimeout(3000);
     }
 
-    // 5) Extraer pares clave: valor con varias estrategias
+       // 5) Extraer datos con selectores dirigidos y filtrando fechas/horas
     const datos = await page.evaluate(() => {
       const out = {};
 
-      // a) Pares “Campo: Valor” en texto simple
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-      let node;
-      const textSnips = [];
-      while ((node = walker.nextNode())) {
-        const t = (node.nodeValue || '').trim();
-        if (t) textSnips.push(t);
-      }
-      textSnips.forEach(t => {
-        const m = t.match(/^(.+?):\s*(.+)$/);
-        if (m) {
-          const key = m[1].trim();
-          const val = m[2].trim();
-          out[key] = val;
-        }
+      const add = (k, v) => {
+        if (!k || !v) return;
+        const key = String(k).replace(/\s+/g, ' ').trim();
+        const val = String(v).replace(/\s+/g, ' ').trim();
+        // descartar claves sin letras (o que parezcan fecha/hora)
+        if (!/[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(key)) return;
+        if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(key)) return;  // ejemplo: 31/10/2025
+        if (/^\d{1,2}:\d{2}$/.test(key)) return;              // ejemplo: 07:49
+        out[key] = val;
+      };
+
+      // a) Ant Design Descriptions (muy común en paneles React)
+      document.querySelectorAll('.ant-descriptions-item').forEach(item => {
+        const k = item.querySelector('.ant-descriptions-item-label')?.textContent || '';
+        const v = item.querySelector('.ant-descriptions-item-content')?.textContent || '';
+        add(k, v);
       });
 
-      // b) Tablas tipo <tr><th>Campo</th><td>Valor</td></tr> o <td>Campo</td><td>Valor</td>
+      // b) Tablas <tr><th>Campo</th><td>Valor</td>
       document.querySelectorAll('table').forEach(tbl => {
         tbl.querySelectorAll('tr').forEach(tr => {
-          const cells = Array.from(tr.querySelectorAll('th,td')).map(c => c.innerText.trim());
-          if (cells.length >= 2) {
-            const key = cells[0];
-            const val = cells.slice(1).join(' | ');
-            if (key && val) out[key] = val;
-          }
+          const cells = Array.from(tr.querySelectorAll('th,td')).map(c => c.innerText.trim()).filter(Boolean);
+          if (cells.length >= 2) add(cells[0], cells.slice(1).join(' | '));
         });
       });
 
-      // c) Tarjetas tipo <div><label>Campo</label><span>Valor</span>
-      document.querySelectorAll('label, .label, strong').forEach(lbl => {
-        const key = lbl.innerText?.trim();
-        let val = '';
-        if (!key) return;
-        // busca un hermano cercano con el valor
-        const parent = lbl.parentElement;
-        if (parent) {
-          const span = parent.querySelector('span, .value, .dato, p, div');
-          if (span && span !== lbl) val = span.innerText?.trim() || '';
+      // c) Definition lists <dl><dt>Campo</dt><dd>Valor</dd>
+      document.querySelectorAll('dl').forEach(dl => {
+        const dts = dl.querySelectorAll('dt'); const dds = dl.querySelectorAll('dd');
+        for (let i = 0; i < Math.min(dts.length, dds.length); i++) {
+          add(dts[i].innerText, dds[i].innerText);
         }
-        if (key && val) out[key] = val;
+      });
+
+      // d) Fallback “Campo: Valor” SOLO si lado izquierdo tiene letras
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node; const lines = [];
+      while ((node = walker.nextNode())) {
+        const t = (node.nodeValue || '').trim();
+        if (t) lines.push(t);
+      }
+      lines.forEach(t => {
+        const m = t.match(/^(.+?):\s*(.+)$/);
+        if (m && /[A-Za-zÁÉÍÓÚÑáéíóúñ]/.test(m[1])) add(m[1], m[2]);
       });
 
       return out;
     });
 
-   // 6) Normalizar la clave y el valor de “Estado Sello”
-const keySello = Object.keys(datos).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
-if (keySello) {
-  const valor = String(datos[keySello]).trim().toUpperCase();
-  datos['Estado Sello'] = valor;
-  if (keySello !== 'Estado Sello') delete datos[keySello];
-}
+    // 6) Normalizar la clave y el valor de “Estado Sello”
+    const keySello = Object.keys(datos).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
+    if (keySello) {
+      const valor = String(datos[keySello]).trim().toUpperCase();
+      datos['Estado Sello'] = valor;
+      if (keySello !== 'Estado Sello') delete datos[keySello];
+    }
+
+    // 6.bis) Asegurar que siempre devolvemos la patente consultada
+    if (!datos['Patente']) {
+      datos['Patente'] = patente;
+    }
 
     // 7) (Opcional) captura pantalla si debug
     if (debug) {
