@@ -4,7 +4,7 @@ import { chromium } from 'playwright';
 
 const app = express();
 
-// ======== CONFIG =========
+// ========= CONFIG =========
 const PORT = process.env.PORT || 3000;
 const TARGET_URL = process.env.TARGET_URL || 'https://estado-integraciones.dev.tracktec.cl/';
 const ORIGINS = new Set(
@@ -14,18 +14,15 @@ const ORIGINS = new Set(
     .filter(Boolean)
 );
 
-// Caché en memoria (10 minutos por patente)
+// Cache simple en memoria (10 min)
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || (10 * 60 * 1000));
 const cache = new Map(); // patente -> { t, data }
 
-// ======== MIDDLEWARES ========
+// ========= MIDDLEWARES =========
 app.use(morgan('tiny'));
-
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
-  if (ORIGINS.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
+  if (ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -33,82 +30,95 @@ app.use((req, res, next) => {
   next();
 });
 
-// ======== UTILS ========
+// ========= SCRAPE =========
 async function runScrape(patente, debug = false) {
   const browser = await chromium.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
+
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
-    viewport: { width: 1280, height: 800 }
+    viewport: { width: 1366, height: 900 }
   });
   const page = await ctx.newPage();
 
   // Bloquear recursos pesados
   await page.route('**/*', (route) => {
-    const req = route.request();
-    const type = req.resourceType();
-    if (['image', 'media', 'font'].includes(type)) return route.abort();
+    const t = route.request().resourceType();
+    if (['image', 'media', 'font'].includes(t)) return route.abort();
     route.continue();
   });
 
   try {
-    // 1) Ir al sitio
+    // 1) Ir
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // 2) Escribir patente
+    // 2) Input patente (según tus capturas: placeholder "Ingresa Patente")
     const inputSelectors = [
+      'input[placeholder*="Ingresa Patente" i]',
       'input[placeholder*="Patente" i]',
       'input[name*="patent" i]',
       'input[id*="patent" i]',
       'input[type="text"]'
     ];
-    let okInput = false;
+    let input = null;
     for (const sel of inputSelectors) {
-      const el = await page.$(sel);
-      if (el) { await el.fill(patente); okInput = true; break; }
+      input = await page.$(sel);
+      if (input) break;
     }
-    if (!okInput) throw new Error('No se encontró el input de patente');
+    if (!input) throw new Error('No se encontró el input de patente');
+    await input.fill(patente.toUpperCase());
 
-    // 3) Click en "Buscar"
+    // 3) Botón Buscar
     const btnSelectors = [
       'button:has-text("Buscar")',
-      'text=Buscar',
-      'input[type="submit"]'
+      'button[type="submit"]',
+      'text=Buscar'
     ];
-    let okBtn = false;
+    let btn = null;
     for (const sel of btnSelectors) {
       const el = await page.$(sel);
-      if (el) { await el.click(); okBtn = true; break; }
+      if (el) { btn = el; break; }
     }
-    if (!okBtn) throw new Error('No se encontró el botón Buscar');
+    if (!btn) throw new Error('No se encontró el botón Buscar');
+    await btn.click();
 
-    // 4) Esperar resultados
-    const waitSelectors = [
-      'text="Estado Sello"', 'text=Estado Sello', '.resultado, .resultados, .card, .table'
+    // 4) Esperar algún resultado (según UI de tus capturas)
+    const waiters = [
+      'text=Patente:',
+      'text=Transportista:',
+      'text=Estado Sello:'
     ];
-    let okWait = false;
-    for (const sel of waitSelectors) {
-      try { await page.waitForSelector(sel, { timeout: 15000 }); okWait = true; break; } catch {}
+    let ok = false;
+    for (const w of waiters) {
+      try { await page.waitForSelector(w, { timeout: 15000 }); ok = true; break; } catch {}
     }
-    if (!okWait) await page.waitForTimeout(3000);
+    if (!ok) {
+      // último intento: esperar algo de tiempo + actividad de red
+      await page.waitForTimeout(2500);
+    }
 
-    // 5) Extraer datos y “puntos rojos”
+    // 5) Extraer datos
     const payload = await page.evaluate(() => {
       const out = {};
       const reds = [];
 
+      // Helpers
       const isRed = (rgb) => {
         const m = rgb && rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
         if (!m) return false;
         const r = +m[1], g = +m[2], b = +m[3];
-        return r >= 170 && g <= 70 && b <= 70; // rojo visible
+        // "rojo" notable
+        return r >= 170 && g <= 90 && b <= 90;
       };
+
       const nearestLabel = (el) => {
+        // Subir pocos niveles buscando strong/label/th...
         let cur = el;
         for (let i = 0; i < 4 && cur; i++) {
-          const bySel = cur.querySelector?.('label, .label, strong, b, h3, h4, th');
+          const bySel = cur.querySelector?.('strong, b, label, .label, th, h3, h4');
           if (bySel && bySel.textContent.trim()) return bySel.textContent.trim();
+          // hermanos previos con texto corto
           let p = cur.previousElementSibling;
           while (p) {
             const t = p.textContent?.trim();
@@ -117,103 +127,89 @@ async function runScrape(patente, debug = false) {
           }
           cur = cur.parentElement;
         }
-        const selfText = el.textContent?.trim();
-        return selfText || 'Indicador rojo';
+        return el.textContent?.trim() || 'Indicador rojo';
       };
 
-      // a) Texto “Campo: Valor”
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-      let node; const textSnips = [];
-      while ((node = walker.nextNode())) {
-        const t = (node.nodeValue || '').trim();
-        if (t) textSnips.push(t);
-      }
-      textSnips.forEach(t => {
-        const m = t.match(/^(.+?):\s*(.+)$/);
-        if (m) {
-          const key = m[1].trim();
-          const val = m[2].trim();
-          out[key] = val;
-          if (/🔴|🟥|⛔|❌/u.test(val) || /\brojo\b/i.test(val)) reds.push(key);
-        }
-      });
-
-      // b) Tablas
-      document.querySelectorAll('table').forEach(tbl => {
-        tbl.querySelectorAll('tr').forEach(tr => {
-          const cells = Array.from(tr.querySelectorAll('th,td')).map(c => c.innerText.trim());
-          if (cells.length >= 2) {
-            const key = cells[0];
-            const val = cells.slice(1).join(' | ');
-            if (key && val) {
-              out[key] = val;
-              if (/🔴|🟥|⛔|❌/u.test(val) || /\brojo\b/i.test(val)) reds.push(key);
-            }
-          }
-        });
-      });
-
-      // c) Tarjetas label + valor
-      document.querySelectorAll('label, .label, strong, b').forEach(lbl => {
-        const key = lbl.innerText?.trim();
+      // a) Patrón muy típico de la UI del sitio: <p><strong>Etiqueta:</strong> Valor</p>
+      document.querySelectorAll('strong, b').forEach(s => {
+        const key = s.textContent?.trim();
         if (!key) return;
-        const parent = lbl.parentElement;
+
+        // Tomar el texto de "Valor" que queda en el mismo contenedor, detrás del strong
         let val = '';
+        const parent = s.parentElement;
         if (parent) {
-          const span = parent.querySelector('span, .value, .dato, p, div');
-          if (span && span !== lbl) val = span.innerText?.trim() || '';
+          // valor suele ser un nodo de texto o un span hermano
+          const nodes = Array.from(parent.childNodes);
+          const idx = nodes.indexOf(s);
+          const after = nodes.slice(idx + 1).map(n => (n.textContent || '').trim()).filter(Boolean).join(' ').trim();
+          if (after) val = after;
         }
-        if (key && val) {
-          out[key] = val;
-          if (/🔴|🟥|⛔|❌/u.test(val) || /\brojo\b/i.test(val)) reds.push(key);
-        }
+
+        // Ajuste: si el key trae ":" al final, limpiarlo
+        const cleanKey = key.replace(/\s*:\s*$/,'');
+        if (cleanKey && val) out[cleanKey] = val;
       });
 
-      // d) Puntos/bolitas coloreadas por CSS
+      // b) “Ver en mapa” → sacar href
+      const link = Array.from(document.querySelectorAll('a')).find(a => /ver en mapa/i.test(a.textContent || ''));
+      if (link && link.href) {
+        out['Ubicación'] = link.href;
+      }
+
+      // c) Detección de puntos/bolitas rojas (span/div pequeñitos rojos)
       const all = Array.from(document.querySelectorAll('*'));
       all.forEach(el => {
         const cs = getComputedStyle(el);
-        const looksDot = el.textContent?.trim() === '•' || el.textContent?.trim() === '●' || /dot|status|badge/i.test(el.className || '');
-        if (looksDot || isRed(cs.color) || isRed(cs.backgroundColor)) {
+        const sizeLikelyDot =
+          (parseFloat(cs.width) <= 20 && parseFloat(cs.height) <= 20) ||
+          (el.textContent && el.textContent.trim().length <= 2);
+        if (sizeLikelyDot && (isRed(cs.color) || isRed(cs.backgroundColor))) {
           const label = nearestLabel(el);
-          if (label && !reds.includes(label)) reds.push(label);
+          if (label && !reds.includes(label)) reds.push(label.replace(/\s*:\s*$/,''));
         }
       });
 
-      // Normalizar Estado Sello
-      const keySello = Object.keys(out).find(k => k.toLowerCase().includes('estado') && k.toLowerCase().includes('sello'));
-      if (keySello) out[keySello] = String(out[keySello]).trim();
+      // d) Normalizar claves importantes
+      const selloKey = Object.keys(out).find(k => /estado\s*sello/i.test(k));
+      if (selloKey) out[selloKey] = String(out[selloKey]).trim();
 
-      return { out, reds: Array.from(new Set(reds)) };
+      const dbmsKey = Object.keys(out).find(k => /^dbms$/i.test(k));
+      if (dbmsKey) out[dbmsKey] = String(out[dbmsKey]).trim();
+
+      return { out, reds };
     });
 
     const datos = payload.out || {};
-    const alertasRojas = new Set(payload.reds || []);
+    const rojos = new Set(payload.reds || []);
 
-    // --- Regla explícita: DBMS NO ACREDITADO ---
-    const dbmsKey = Object.keys(datos).find(k => k.toLowerCase().trim() === 'dbms');
-    if (dbmsKey) {
-      const dbmsVal = String(datos[dbmsKey] || '');
-      if (/no\s*acreditado/i.test(dbmsVal)) {
-        alertasRojas.add('DBMS: NO ACREDITADO');
-      }
+    // Reglas de alerta adicionales
+    // - DBMS: NO acreditado
+    const kDbms = Object.keys(datos).find(k => /^dbms$/i.test(k));
+    if (kDbms && /no\s*acreditado/i.test(String(datos[kDbms]))) {
+      rojos.add('DBMS');
+    }
+
+    // - Estado Sello ≠ ACTIVO (no lo metemos en __alertas_rojas; el front ya lo trata,
+    //   pero por compatibilidad, lo incluimos para resalte de fila)
+    const kSello = Object.keys(datos).find(k => /estado\s*sello/i.test(k));
+    if (kSello && String(datos[kSello]).trim().toUpperCase() !== 'ACTIVO') {
+      rojos.add('Estado Sello');
     }
 
     if (debug) await page.screenshot({ path: 'debug.png', fullPage: true });
 
     await browser.close();
 
-    if (alertasRojas.size) {
-      datos.__alertas_rojas = Array.from(alertasRojas);
-    }
+    if (rojos.size) datos.__alertas_rojas = Array.from(rojos);
     return datos;
-  } catch (e) {
+  } catch (err) {
     await browser.close();
-    throw e;
+    throw err;
   }
 }
 
-// ======== RUTAS ========
+// ========= RUTAS =========
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.get('/api/estado', async (req, res) => {
@@ -229,11 +225,9 @@ app.get('/api/estado', async (req, res) => {
 
   try {
     const data = await runScrape(patente, debug);
-
     if (!data || Object.keys(data).length === 0) {
       return res.status(200).json({ Patente: patente, mensaje: 'Sin datos detectados. Ajustar selectores.' });
     }
-
     cache.set(patente, { t: Date.now(), data });
     res.json(data);
   } catch (e) {
